@@ -42,7 +42,7 @@ from sklearn.metrics import log_loss, accuracy_score
 @dataclass
 class Config:
     output_dir: str = f"output-{VER}"
-    checkpoint: str = "gemma2-9b-it-fp16"  
+    checkpoint: str = "FsfairX-Gemma2-RM-v0.1"  
     max_length: int = 2048
     n_splits: int = 5
     fold_idx: int = 0
@@ -55,7 +55,7 @@ class Config:
     lr: float = 2e-4
     warmup_steps: int = 20
     lora_r: int = 64
-    lora_alpha: float = 4 
+    lora_alpha: float = 8
     lora_dropout: float = 0.05
     lora_bias: str = "none"
     
@@ -76,7 +76,7 @@ training_args = TrainingArguments(
     #save_steps=200,
     optim=config.optim_type,
     fp16=True, 
-    #bf16=False,
+    # bf16=True,
     learning_rate=config.lr,
     warmup_steps=config.warmup_steps,
 
@@ -124,20 +124,6 @@ if USE_QLORA:
     print("Using QLoRA")
 
 # %%
-from torch import nn
-import torch.nn.functional as F
-class DistillKL(nn.Module):
-    """Distilling the Knowledge in a Neural Network"""
-    def __init__(self, T):
-        super(DistillKL, self).__init__()
-        self.T = T
-    def forward(self, y_s, y_t):
-        p_s = F.log_softmax(y_s/self.T, dim=1)
-        p_t = F.softmax(y_t/self.T, dim=1)
-        loss = F.kl_div(p_s, p_t, size_average=False) * (self.T**2) / y_s.shape[0]
-        return loss
-
-# %%
 import torch
 import torch.nn as nn
 from transformers import Gemma2ForSequenceClassification, Gemma2Config
@@ -147,15 +133,35 @@ class CustomGemma2ForSequenceClassification(Gemma2ForSequenceClassification):
         super().__init__(config)
         self.num_labels_head1 = num_labels_head1
         self.num_labels_head2 = num_labels_head2
-        self.classifier_head1 = nn.Linear(config.hidden_size, num_labels_head1, bias=False)
-        self.classifier_head2 = nn.Linear(config.hidden_size, num_labels_head2, bias=False)
+        hdim = config.hidden_size
+        self.classifier_head1 = torch.nn.Sequential(
+                                    torch.nn.Dropout(0.1),
+                                    torch.nn.Linear(hdim, hdim // 2),
+                                    torch.nn.Dropout(0.1),
+                                    torch.nn.GELU(),
+                                    torch.nn.Linear(hdim // 2, num_labels_head1),
+                                )
+        self.classifier_head2 = torch.nn.Sequential(
+                                    torch.nn.Dropout(0.1),
+                                    torch.nn.Linear(hdim, hdim // 2),
+                                    torch.nn.Dropout(0.1),
+                                    torch.nn.GELU(),
+                                    torch.nn.Linear(hdim // 2, num_labels_head2),
+                                )
+        self.score = torch.nn.Sequential(
+                            torch.nn.Dropout(0.1),
+                            torch.nn.Linear(hdim, hdim // 2),
+                            torch.nn.Dropout(0.1),
+                            torch.nn.GELU(),
+                            torch.nn.Linear(hdim // 2, 2),
+                        )
 
-    def forward(self, input_ids, attention_mask=None, labels=None, teacher_logits=None, **kwargs):
+    def forward(self, input_ids, attention_mask=None, labels=None, **kwargs):
         device = input_ids.device
 
         if labels is not None:
             labels = labels.to(device)
-            outputs = super().forward(input_ids, attention_mask=attention_mask, labels=labels[:, 0], output_hidden_states=True)
+            outputs = super().forward(input_ids, attention_mask=attention_mask, output_hidden_states=True)
         else:
             outputs = super().forward(input_ids, attention_mask=attention_mask)
 
@@ -170,17 +176,14 @@ class CustomGemma2ForSequenceClassification(Gemma2ForSequenceClassification):
             labels_head1 = labels[:, 1].to(device)
             labels_head2 = labels[:, 2].to(device)
             
-            dis_loss1 = DistillKL(T=2)(outputs.logits.to(device), teacher_logits[:, :2].to(device))
-            dis_loss2 = DistillKL(T=2)(outputs.logits.to(device), teacher_logits[:, 2:].to(device))
-            loss_head1 = nn.CrossEntropyLoss()(outputs_head1, labels_head1)
-            loss_head2 = nn.CrossEntropyLoss()(outputs_head2, labels_head2)
-            loss = outputs.loss.to(device) + 0.1 * loss_head1 + 0.1 * loss_head2 + 0.25 * dis_loss1 + 0.25 * dis_loss2
+            loss_head1 = nn.CrossEntropyLoss(label_smoothing=0.05)(outputs_head1, labels_head1)
+            loss_head2 = nn.CrossEntropyLoss(label_smoothing=0.05)(outputs_head2, labels_head2)
+            loss = nn.CrossEntropyLoss(label_smoothing=0.05)(outputs.logits.to(device), labels[:, 0].to(device)).to(device) + 0.1 * loss_head1 + 0.1 * loss_head2
             return {"loss": loss, "logits": (outputs.logits, outputs_head1, outputs_head2)}
         else:
             return {"logits": (outputs.logits, outputs_head1, outputs_head2)}
 
 config2 = Gemma2Config.from_pretrained(config.checkpoint)
-config2.num_labels = 2
 model = CustomGemma2ForSequenceClassification.from_pretrained(
     config.checkpoint,
     config=config2,
@@ -203,10 +206,15 @@ model.print_trainable_parameters()
 # %%
 import pandas as pd
 
-df = pd.read_parquet("dataset/10k_train.parquet")
-df_m0 = pd.DataFrame(np.load('dataset/logits_m0.npy')[:, :2], columns=['m0_a', 'm0_b'])
-df_m3 = pd.DataFrame(np.load('dataset/logits_m3.npy')[:, :2], columns=['m3_a', 'm3_b'])
-df = pd.concat([df, df_m0, df_m3], axis=1)
+df_train = pd.read_parquet("dataset/train_fold0.parquet").drop('language', axis=1)
+df_valid = pd.read_parquet('dataset/valid_fold0.parquet').drop('language', axis=1)
+df_add = pd.read_parquet('dataset/47k_train.parquet')
+df_add['fold'] = 100
+if DEBUG:
+    df_train = df_train.iloc[:16]
+    df_valid = df_valid.iloc[:16]
+    df_add = df_add.iloc[:16]
+df = pd.concat([df_train, df_valid, df_add], ignore_index=True)
 df["id"] = df["id"].astype("str")
 print('Competition data has shape', df.shape )
 LN = len(df)
@@ -215,8 +223,6 @@ df.head(1)
 # %%
 if ADD_33K:
     df = pd.concat([df,df2],axis=0,ignore_index=True)
-if DEBUG:
-    df = df.iloc[:64].copy()
 print("We will use train data with shape", df.shape )
 
 # %%
@@ -235,10 +241,11 @@ df.model_b = df.model_b.map(MAP).astype('int32')
 df.head(1)
 
 # %%
-ds = Dataset.from_pandas(df)
+train_ds = Dataset.from_pandas(df[df['fold'] != 0].copy())
+valid_ds = Dataset.from_pandas(df[df['fold'] == 0].copy())
 
 # %%
-import json
+# import json
 
 class CustomTokenizer:
     def __init__(
@@ -250,31 +257,51 @@ class CustomTokenizer:
         self.max_length = max_length
 
     def prepare_text(self, prompts, responses_a, responses_b):
+        truncation_p_flag = False
+        origin_p = prompts
+        
+        instruction = '<start_of_turn>Which response is better? [A or B]\nAnswer: '
 
-        prompt_length = len(self.tokenizer(prompts)['input_ids'])
-        if prompt_length > self.max_length // 2:
-            prompt_length = self.max_length // 2
-            prompts = self.tokenizer.decode(self.tokenizer(prompts)['input_ids'][-prompt_length:-1])
-        response_a_length = len(self.tokenizer(responses_a)['input_ids'])
-        response_b_length = len(self.tokenizer(responses_b)['input_ids'])
-        if prompt_length + response_a_length + response_b_length > self.max_length:
-            response_length = (self.max_length - prompt_length) // 2
-            responses_a = self.tokenizer.decode(self.tokenizer(responses_a)['input_ids'][-response_length:-1])
-            responses_b = self.tokenizer.decode(self.tokenizer(responses_b)['input_ids'][-response_length:-1])
+        # 去掉instruction的token, 去掉首尾<bos>和<eos>两个token
+        remain_len = self.max_length - len(self.tokenizer(instruction, add_special_tokens=False)['input_ids']) - 2
+
+        # 去掉<eos>和<bos>两个token，`<start_of_turn>prompt\n<end_of_turn>\n`一共占5个token
+        prompt_length = len(self.tokenizer(prompts)['input_ids'][1:-1]) + 5
+        origin_p_len = prompt_length
         
-        rounds = [
-            f"<start_of_turn>prompt\n{prompts}<end_of_turn>\n"
-            +f"<start_of_turn>response_a\n{responses_a}<end_of_turn>\n"
-            +f"<start_of_turn>response_b\n{responses_b}<end_of_turn>"
-        ]
+        if prompt_length > remain_len // 2:
+            prompt_length = remain_len // 2
+            prompts = '......' + self.tokenizer.decode(self.tokenizer(prompts)['input_ids'][1:-1][-prompt_length + 6:])
+            truncation_p_flag = True
+        remain_len -= prompt_length
+        prompts = f"<start_of_turn>prompt\n{prompts}<end_of_turn>\n"
+
+        # <start_of_turn>response_b\n<end_of_turn>\n占7个token
+        response_a_length = len(self.tokenizer(responses_a)['input_ids'][1:-1]) + 7
+        response_b_length = len(self.tokenizer(responses_b)['input_ids'][1:-1]) + 7
         
-        # for k in range(len(rounds)):
-        #     tmp = "\n".join(rounds[k:])
-        #     if len( self.tokenizer(tmp)["input_ids"] ) < self.max_length: 
-        #         break
-        tmp = rounds[0]
-        
-        return tmp
+        if response_a_length + response_b_length > remain_len:
+            # 按照模型输出长度比例分配
+            response_a_length = int(remain_len * response_a_length / (response_a_length + response_b_length))
+            response_b_length = int(remain_len * response_b_length / (response_a_length + response_b_length))
+            responses_a = '......' + self.tokenizer.decode(self.tokenizer(responses_a)['input_ids'][1:-1][-response_a_length + 8:])
+            responses_b = '......' + self.tokenizer.decode(self.tokenizer(responses_b)['input_ids'][1:-1][-response_b_length + 8:])
+        remain_len -= (response_a_length + response_b_length)
+
+        response_a = f"<start_of_turn>response_a\n{responses_a}<end_of_turn>\n"
+        response_b = f"<start_of_turn>response_b\n{responses_b}<end_of_turn>\n"
+
+        # 检测是不是还有空间给prompts
+        if remain_len > self.max_length // 10 and truncation_p_flag:
+            remain_len += prompt_length
+            if remain_len < origin_p_len:
+                prompts = '......' + self.tokenizer.decode(self.tokenizer(origin_p)['input_ids'][1:-1][-remain_len + 6:])
+            else:
+                prompts = origin_p
+            prompts = f"<start_of_turn>prompt\n{prompts}<end_of_turn>\n"          
+
+        return prompts + response_a + response_b + instruction
+
         
     def __call__(self, batch: dict) -> dict:
         
@@ -292,14 +319,12 @@ class CustomTokenizer:
             elif win == 'model_b':
                 label = 1
             labels.append( (label,c,d) )
-        teacher_logits = []
-        for m0_a, m0_b, m3_a, m3_b in zip(batch['m0_a'], batch['m0_b'], batch['m3_a'], batch['m3_b']):
-            teacher_logits.append((m0_a, m0_b, m3_a, m3_b))
-        return {**tokenized, "labels": labels, "teacher_logits": teacher_logits}#, "texts": texts}
+        return {**tokenized, "labels": labels} #, "texts": texts}
 
 # %%
 encode = CustomTokenizer(tokenizer, max_length=config.max_length)
-ds = ds.map(encode, batched=True, num_proc=8)
+train_ds = train_ds.map(encode, batched=True, num_proc=8)
+valid_ds = valid_ds.map(encode, batched=True, num_proc=8)
 
 # %%
 def compute_metrics(eval_preds: EvalPrediction) -> dict:
@@ -338,33 +363,33 @@ def compute_metrics(eval_preds: EvalPrediction) -> dict:
     }
 
 # %%
-if TRAIN_100_PERCENT:
-    folds = [
-        (
-            [i for i in range(len(ds))], 
-            [i for i in range(len(ds)) if (i % config.n_splits == fold_idx)&(i<LN)]
-        ) 
-        for fold_idx in range(config.n_splits)
-    ]
-    print("We are training with 100% data")
-else:
-    folds = [
-        (
-            [i for i in range(len(ds)) if i % config.n_splits != fold_idx],
-            [i for i in range(len(ds)) if (i % config.n_splits == fold_idx)&(i<LN)]
-        ) 
-        for fold_idx in range(config.n_splits)
-    ]    
+# if TRAIN_100_PERCENT:
+#     folds = [
+#         (
+#             [i for i in range(len(ds))], 
+#             [i for i in range(len(ds)) if (i % config.n_splits == fold_idx)&(i<LN)]
+#         ) 
+#         for fold_idx in range(config.n_splits)
+#     ]
+#     print("We are training with 100% data")
+# else:
+#     folds = [
+#         (
+#             [i for i in range(len(ds)) if i % config.n_splits != fold_idx],
+#             [i for i in range(len(ds)) if (i % config.n_splits == fold_idx)&(i<LN)]
+#         ) 
+#         for fold_idx in range(config.n_splits)
+#     ]    
 
 # %%
-train_idx, eval_idx = folds[config.fold_idx]
+# train_idx, eval_idx = folds[config.fold_idx]
 
 trainer = Trainer(
     args=training_args, 
     model=model,
     tokenizer=tokenizer,
-    train_dataset=ds.select(train_idx),
-    eval_dataset=ds.select(eval_idx),
+    train_dataset=train_ds,
+    eval_dataset=valid_ds,
     compute_metrics=compute_metrics,
     data_collator=DataCollatorWithPadding(tokenizer=tokenizer),
 )
@@ -372,5 +397,8 @@ trainer.train()
 
 # %%
 trainer.save_model(f"LoRA-v{VER}")
+
+# %%
+
 
 
