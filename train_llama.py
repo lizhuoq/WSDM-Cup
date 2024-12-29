@@ -8,11 +8,11 @@
 import os
 os.environ["CUDA_VISIBLE_DEVICES"]="0,1,2,3"
 
-VER=157
+VER=158
 
 # FINAL SOLUTION IS USE_QLORA=FALSE, TRAIN_100_PERCENT=TRUE, ADD_33K=TRUE, DEBUG=FALSE
 USE_QLORA = False
-TRAIN_100_PERCENT = True
+TRAIN_100_PERCENT = False
 ADD_33K = False
 DEBUG = False
 
@@ -26,9 +26,9 @@ import torch
 from datasets import Dataset
 from transformers import (
     BitsAndBytesConfig,
-    Gemma2ForSequenceClassification,
-    GemmaTokenizerFast,
-    Gemma2Config,
+    LlamaForSequenceClassification,
+    AutoTokenizer,
+    AutoConfig,
     PreTrainedTokenizerBase, 
     EvalPrediction,
     Trainer,
@@ -42,7 +42,7 @@ from sklearn.metrics import log_loss, accuracy_score
 @dataclass
 class Config:
     output_dir: str = f"output-{VER}"
-    checkpoint: str = "FsfairX-Gemma2-RM-v0.1"  
+    checkpoint: str = "ArmoRM-Llama3-8B-v0.1"  
     max_length: int = 2048
     n_splits: int = 5
     fold_idx: int = 0
@@ -52,10 +52,10 @@ class Config:
     per_device_eval_batch_size: int = 4
     n_epochs: int = 1
     freeze_layers: int = 0 # there're 42 layers in total, we don't add adapters to the first 16 layers
-    lr: float = 2e-4
-    warmup_steps: int = 20
-    lora_r: int = 64
-    lora_alpha: float = 4
+    lr: float = 2e-5
+    warmup_steps: int = 0
+    lora_r: int = 128
+    lora_alpha: float = 128 
     lora_dropout: float = 0.05
     lora_bias: str = "none"
     
@@ -97,7 +97,7 @@ lora_config = LoraConfig(
     # only target self-attention
     target_modules=["q_proj", "k_proj", "v_proj",
                     "down_proj","up_proj","o_proj","gate_proj"],
-    layers_to_transform=[i for i in range(42) if i >= config.freeze_layers],
+    layers_to_transform=[i for i in range(32) if i >= config.freeze_layers],
     lora_dropout=config.lora_dropout,
     bias=config.lora_bias,
     task_type=TaskType.SEQ_CLS,
@@ -105,7 +105,7 @@ lora_config = LoraConfig(
 )
 
 # %%
-tokenizer = GemmaTokenizerFast.from_pretrained(config.checkpoint)
+tokenizer = AutoTokenizer.from_pretrained(config.checkpoint, use_fast=True)
 tokenizer.add_eos_token = True  # We'll add <eos> at the end
 tokenizer.padding_side = "right"
 
@@ -126,9 +126,8 @@ if USE_QLORA:
 # %%
 import torch
 import torch.nn as nn
-from transformers import Gemma2ForSequenceClassification, Gemma2Config
 
-class CustomGemma2ForSequenceClassification(Gemma2ForSequenceClassification):
+class CustomLlama3ForSequenceClassification(LlamaForSequenceClassification):
     def __init__(self, config, num_labels_head1=60, num_labels_head2=60):
         super().__init__(config)
         self.num_labels_head1 = num_labels_head1
@@ -183,8 +182,8 @@ class CustomGemma2ForSequenceClassification(Gemma2ForSequenceClassification):
         else:
             return {"logits": (outputs.logits, outputs_head1, outputs_head2)}
 
-config2 = Gemma2Config.from_pretrained(config.checkpoint)
-model = CustomGemma2ForSequenceClassification.from_pretrained(
+config2 = AutoConfig.from_pretrained(config.checkpoint)
+model = CustomLlama3ForSequenceClassification.from_pretrained(
     config.checkpoint,
     config=config2,
     num_labels_head1=126,
@@ -195,7 +194,7 @@ model = CustomGemma2ForSequenceClassification.from_pretrained(
 )
 
 model.config.use_cache = False
-model.config.attn_logit_softcapping = None
+# model.config.attn_logit_softcapping = None
 model = prepare_model_for_kbit_training(model)
 model = get_peft_model(model, lora_config)
 model
@@ -263,47 +262,47 @@ class CustomTokenizer:
         truncation_p_flag = False
         origin_p = prompts
         
-        instruction = '<start_of_turn>Which response is better? [A or B]\nAnswer: '
+        instruction = '<|start_header_id|>Which response is better? [A or B]<|end_header_id|>\nAnswer: '
 
         # 去掉instruction的token, 去掉首尾<bos>和<eos>两个token
         remain_len = self.max_length - len(self.tokenizer(instruction, add_special_tokens=False)['input_ids']) - 2
 
-        # 去掉<eos>和<bos>两个token，`<start_of_turn>prompt\n<end_of_turn>\n`一共占5个token
-        prompt_length = len(self.tokenizer(prompts)['input_ids'][1:-1]) + 5
+        # 去掉<eos>和<bos>两个token，`<start_of_turn>prompt\n<end_of_turn>\n`一共占6个token
+        prompt_length = len(self.tokenizer(prompts)['input_ids']) + 6
         origin_p_len = prompt_length
         
         if prompt_length > remain_len // 2:
             prompt_length = remain_len // 2
-            prompts = '......' + self.tokenizer.decode(self.tokenizer(prompts)['input_ids'][1:-1][-prompt_length + 6:])
+            prompts = '......' + self.tokenizer.decode(self.tokenizer(prompts)['input_ids'][-prompt_length + 7:])
             truncation_p_flag = True
         remain_len -= prompt_length
-        prompts = f"<start_of_turn>prompt\n{prompts}<end_of_turn>\n"
+        prompts = f"<|start_header_id|>prompt<|end_header_id|>\n{prompts}<|eot_id|>\n"
 
         # <start_of_turn>response_b\n<end_of_turn>\n占7个token
-        response_a_length = len(self.tokenizer(responses_a)['input_ids'][1:-1]) + 7
-        response_b_length = len(self.tokenizer(responses_b)['input_ids'][1:-1]) + 7
+        response_a_length = len(self.tokenizer(responses_a)['input_ids']) + 7
+        response_b_length = len(self.tokenizer(responses_b)['input_ids']) + 7
         
         if response_a_length + response_b_length > remain_len:
             # 按照模型输出长度比例分配
             response_a_length = int(remain_len * response_a_length / (response_a_length + response_b_length))
             response_b_length = int(remain_len * response_b_length / (response_a_length + response_b_length))
-            responses_a = '......' + self.tokenizer.decode(self.tokenizer(responses_a)['input_ids'][1:-1][-response_a_length + 8:])
-            responses_b = '......' + self.tokenizer.decode(self.tokenizer(responses_b)['input_ids'][1:-1][-response_b_length + 8:])
+            responses_a = '......' + self.tokenizer.decode(self.tokenizer(responses_a)['input_ids'][-response_a_length + 8:])
+            responses_b = '......' + self.tokenizer.decode(self.tokenizer(responses_b)['input_ids'][-response_b_length + 8:])
         remain_len -= (response_a_length + response_b_length)
 
-        response_a = f"<start_of_turn>response_a\n{responses_a}<end_of_turn>\n"
-        response_b = f"<start_of_turn>response_b\n{responses_b}<end_of_turn>\n"
+        response_a = f"<|start_header_id|>response_a<|end_header_id|>\n{responses_a}<|eot_id|>\n"
+        response_b = f"<|start_header_id|>response_b<|end_header_id|>\n{responses_b}<|eot_id|>\n"
 
         # 检测是不是还有空间给prompts
         if remain_len > 0 and truncation_p_flag:
             remain_len += prompt_length
             if remain_len < origin_p_len:
-                prompts = '......' + self.tokenizer.decode(self.tokenizer(origin_p)['input_ids'][1:-1][-remain_len + 6:])
+                prompts = '......' + self.tokenizer.decode(self.tokenizer(origin_p)['input_ids'][-remain_len + 7:])
             else:
                 prompts = origin_p
-            prompts = f"<start_of_turn>prompt\n{prompts}<end_of_turn>\n"          
+            prompts = f"<|start_header_id|>prompt<|end_header_id|>\n{prompts}<|eot_id|>\n"     
 
-        return prompts + response_a + response_b + instruction
+        return '<|begin_of_text|>' + prompts + response_a + response_b + instruction + '<|end_of_text|>'
 
         
     def __call__(self, batch: dict) -> dict:

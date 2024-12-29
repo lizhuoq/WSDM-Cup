@@ -4,4 +4,4 @@
 module load cuda/12.1
 # source activate climsim
 
-~/.conda/envs/climsim/bin/python train_1221.py
+~/.conda/envs/climsim/bin/python train_llama.py
