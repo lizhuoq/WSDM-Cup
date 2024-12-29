@@ -55,7 +55,7 @@ class Config:
     lr: float = 2e-4
     warmup_steps: int = 20
     lora_r: int = 64
-    lora_alpha: float = 8
+    lora_alpha: float = 4
     lora_dropout: float = 0.05
     lora_bias: str = "none"
     
@@ -292,7 +292,7 @@ class CustomTokenizer:
         response_b = f"<start_of_turn>response_b\n{responses_b}<end_of_turn>\n"
 
         # 检测是不是还有空间给prompts
-        if remain_len > self.max_length // 10 and truncation_p_flag:
+        if remain_len > 0 and truncation_p_flag:
             remain_len += prompt_length
             if remain_len < origin_p_len:
                 prompts = '......' + self.tokenizer.decode(self.tokenizer(origin_p)['input_ids'][1:-1][-remain_len + 6:])
